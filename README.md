@@ -32,6 +32,8 @@ R | Time Series Forecasting | Predictive Modelling | Statistical Analysis
 
 ## Files
 
-- Forecasting_Report.pdf: Summary report
-- Forecasting_Project.Rmd: Complete analysis and modelling workflow
-- Forecasting_Project.html: Interactive report
+- **README.md**: Project overview, methods, and results.
+- **Forecasting_Report.pdf**: Summary report
+- **Forecasting_Project.Rmd**: Complete analysis and modelling workflow
+
+Note：The original dataset is not included due to licensing or course restrictions.
