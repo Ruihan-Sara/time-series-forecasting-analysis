@@ -1,0 +1,854 @@
+---
+title: "Forecasting competition - R Markdown"
+author: |
+  Group_gc_7:
+
+date: "2025-11-20"
+output: html_document
+---
+
+
+This notebook implements our workflow to evaluate different forecasting algorithms, respectively ARIMA, TBATS and Linear regression; to select the best models using cross-validation, and to generate Kaggle submissions for the forecasting competition. The last part is explaining our approach to try winning the competition. In order to produce the output in reasonable time despite the really long computation times for some methods, we only partially displayed the results obtained through running our code. A summary of the results obtained is provided when needed.
+
+# 0 - Data preparation
+
+We load the information about the frequency and the forecast horizons for each time series given. This follows the structure of the baseline notebook.
+
+```{r}
+
+convert_frequency = function(freq){
+  Freq_string = c("Daily", "Hourly", "Monthly", "Quarterly", "Weekly", "Yearly")
+  Freq_number = c(7, 24, 12, 4, 52, 1)
+  ind  = which(freq == Freq_string)
+  return(Freq_number[ind])
+}
+
+frequencyfile <- paste("./train/frequency.csv")
+aheadfile <- paste("./train/ahead.csv")
+
+# Example on time series n°1 to illustrate preprocessing results
+
+name <- paste("./train/train_",1,".csv",sep="")#time series train1.csv
+y<- as.matrix(read.csv(name))#load data
+frequency<- as.matrix(read.csv(frequencyfile))#load data
+ahead <- as.matrix(read.csv(aheadfile))#load data
+
+library("fpp2")
+
+# In order to improve computation performance : using a cache + control the code behaviour
+if (!dir.exists("cache")) dir.create("cache")
+RUN_SUBMISSIONS <- interactive()   # TRUE when running interactively, FALSE in R Markdown knitting
+
+DO_EVALUATION  <- FALSE   # run evaluate_model() ? 
+DO_PLOTS       <- TRUE   # produce diagnostic plots ? 
+DO_SUBMISSIONS <- FALSE   # generate Kaggle CSV predictions ? 
+
+```
+
+Here are the different functions we used in order to answer to the questions. In order to build the different sets, the instruction required using the last "h" points of each series as a test set, and all the points before as a training set.
+
+This function loads all 600 time series, builds the train/test sets, and stores all in lists.
+
+
+```{r}
+# Preparing the 600 time series by splitting them into training and test sets
+
+initialize_sets <- function(){
+
+  train_ts_list <- vector("list", 600)
+  test_ts_list  <- vector("list", 600)
+  ts_list       <- vector("list", 600)
+
+  for (ind in 1:600) {
+    h <- ahead[ind]
+    name <- paste("./train/train_", ind, ".csv", sep="")
+    y <- as.matrix(read.csv(name))
+
+    data <- ts(data = y, frequency = convert_frequency(frequency[ind]))
+    ts_list[[ind]] <- data  
+    T <- length(data)
+    dat_train <- window(data, end = time(data)[T - h])
+    dat_test  <- window(data, start = time(data)[T - h + 1])
+
+    # Building the two sets
+    train_ts_list[[ind]] <- dat_train
+    test_ts_list[[ind]]  <- dat_test
+  }
+  
+  OUT <- list(train_ts_list=train_ts_list, test_ts_list=test_ts_list, ts_list=ts_list)
+  return(OUT)
+}
+```
+
+The competition requires cross-validation using the last h points.
+
+This function takes a model function, fits each training set for the 600 time series, forecast h steps and computes the MAE, which is the metric chosen to assess the performance, for every time series.
+
+```{r}
+# Cross-validation evaluation of our models
+
+evaluate_model <- function(model_fun, model_name = NULL) {
+  
+  # Use cache if name provided
+  if (!is.null(model_name)) {
+    
+    cache_file <- paste0("cache/eval_", model_name, ".rds")
+    
+    # If cache exists → load
+    if (file.exists(cache_file)) {
+      message("Loading cached CV results for: ", model_name)
+      return(readRDS(cache_file))
+    }
+  }
+  
+  # If not → compute normally
+  mae <- function(actual, forec) mean(abs(actual - forec))
+
+  df_preds <- matrix(nrow = 0, ncol = 2)
+  mae_vec  <- rep(NA, length(train_ts_list))
+
+  for (ind in seq_along(train_ts_list)) {
+
+    dat_train <- train_ts_list[[ind]]
+    dat_test  <- test_ts_list[[ind]]
+    h         <- ahead[ind]
+
+    model <- model_fun(dat_train)
+    pred <- forecast(model, h = h)
+    predictions <- as.numeric(pred$mean)
+
+    mae_vec[ind] <- mae(dat_test, predictions)
+
+    index <- 1:h
+    df_preds <- rbind(df_preds, cbind(as.integer(nrow(df_preds) + index), predictions))
+  }
+
+  res <- list(
+    mae_vector = mae_vec,
+    mae_mean = mean(mae_vec, na.rm = TRUE),
+    predictions_df = df_preds
+  )
+
+  # Save to cache if model_name provided
+  if (!is.null(model_name)) {
+    saveRDS(res, cache_file)
+    message("Cached results for: ", model_name)
+  }
+
+  return(res)
+}
+
+safe_evaluate <- function(model_fun, model_name = NULL) {
+  if (!DO_EVALUATION) {
+    message("Skipping evaluation for: ", model_name)
+    return(NULL)
+  }
+  evaluate_model(model_fun, model_name)
+}
+
+```
+
+The function below will be used later to generate the submissions for each model that will show better results than the one already on Kaggle.
+
+```{r}
+# Generate the Kaggle submissions, using the right format
+
+generate_submission <- function(model_fun, file_name) {
+
+  df <- matrix(nrow = 0, ncol = 2)
+  
+  for (ind in seq_along(ts_list)) {
+    dat_train <- ts_list[[ind]]
+    h <- ahead[ind]
+    
+    # Fit model
+    model <- model_fun(dat_train)
+    
+    # Forecast
+    pred <- forecast(model, h = h)
+    predictions <- as.numeric(pred$mean)
+    
+    index <- 1:h
+    df <- rbind(df, cbind(as.integer(nrow(df) + index), predictions))
+  }
+  
+  # Write Kaggle file
+  write.table(df, file = file_name, col.names = c("Id", "Predicted"), sep = ",",row.names = FALSE)
+  
+  return(df)
+}
+```
+
+These helper functions allow us to inspect the 3 best and 3 worst series for each model (forecast overlay on the last part of the training data and residuals)
+
+```{r}
+# Diagnostic plotting
+
+plot_forecast_trial <- function(index, predictions, mae_value) {
+  
+  dat_train <- train_ts_list[[index]]
+  h <- ahead[index]
+
+  pred_ts <- ts(predictions, start = time(dat_train)[length(dat_train)] + 1 / frequency(dat_train), frequency = frequency(dat_train))
+
+  # Plot train
+  plot(dat_train, col = "black", lwd = 2, main = paste0("Time series ", index," | MAE = ", round(mae_value, 3)), ylab = "")
+  
+  lines(pred_ts, col = "green", lwd = 2)
+}
+
+plot_residuals <- function(ind, model_fun) {
+  
+  y <- train_ts_list[[ind]]
+  model <- model_fun(y)
+  
+  cat("Model fitted for series #", ind, "\n")
+  print(model)
+  checkresiduals(model)
+}
+
+plot_ts <- function(model_fun, res_model){
+  
+  mae_table <- res_model$mae_vector
+  
+  idx_min <- order(mae_table)[1:3]
+  idx_max <- order(mae_table, decreasing = TRUE)[1:3]
+  indexes <- c(idx_max, idx_min)
+
+  for (ind in indexes){
+    start_row <- sum(ahead[1:(ind - 1)]) + 1
+    end_row   <- sum(ahead[1:ind])
+    preds     <- res_model$predictions_df[start_row:end_row, 2]
+
+    mae_val <- mae_table[ind]
+    plot_forecast_trial(ind, preds, mae_val)
+    plot_residuals(ind, model_fun)
+  }
+}
+
+
+```
+
+# 1 - Using cross-validation to check forecast performance for each algorithm
+
+We start by implementing our baseline algorithms, that will give us the performance we have to beat. The metric used is Mean Absolute Error (MAE), which measures the error between the predicted and the true values.
+
+```{r}
+sets <- initialize_sets()
+train_ts_list <- sets$train_ts_list
+test_ts_list <- sets$test_ts_list
+ts_list <- sets$ts_list
+
+# Baseline ARIMA
+arima_default <- function(y) auto.arima(y)
+res_arima  <- safe_evaluate(arima_default, "arima_default")
+
+# Baseline TBATS
+tbats_default <- function(y) tbats(y)
+res_tbats  <- safe_evaluate(tbats_default, "tbats_default")
+
+# Baseline linear regression
+lr_trend <- function(y) tslm(y ~ trend)
+res_lr <- safe_evaluate(lr_trend, "tslm_trend")
+
+cv_results <- c(
+  ARIMA = res_arima$mae_mean,
+  TBATS = res_tbats$mae_mean,
+  TSLM  = res_lr$mae_mean
+)
+
+cat("The results using cross validation evaluation for each method are\n")
+cv_results
+```
+
+The results using cross validation evaluation each method are 
+
+- ARIMA : $MAE_{arima}$ = 557.2463
+- TBATS : $MAE_{tbats}$ = 519.9090
+- TSLM :  $MAE_{linreg}$ = 1003.5006
+
+# 2 - Training on all data
+
+We then train each baseline model on all available data and produce predictions for Kaggle submission.
+
+```{r}
+if (DO_SUBMISSIONS) {
+  generate_submission(arima_default, "my_prediction_0_autoarima.csv")
+  generate_submission(tbats_default, "my_prediction_0_tbats.csv")
+  generate_submission(lr_trend, "my_prediction_0_tslm.csv")
+}
+```
+
+# 3 - Changing hyperparameters to find the models that work the best
+
+Now that we have seen the performance of our baselines, we explore different hyperparameters for each forecasting family (ARIMA, TBATS, linear regression with time as covariate) in order to improve cross-validation performance. Our strategy is to provide a list of model variants for each algorithm, and then automatically evaluate each variant, store the MAE in tables for comparison purposes, and later on select the best variant for each family.
+
+## 3.a - ARIMA
+
+For ARIMA, we explored different variants:
+
+- stepwise search on/off 
+- approximation on/off 
+- Box-Cox transformation (lambda="auto"), bias adjusted
+
+Indeed, these choices are motivated by several reasons that might improve the results: - stepwise=FALSE forces ARIMA to explore a larger search space - approximation=FALSE gives a more accurate likelihood search - Box-Cox can stabilize variance for some series
+
+The overall score we have to defeat for ARIMA is $MAE_{arima}$ = 557.2463
+
+```{r}
+
+
+arima_variants <- list(
+  default_arima = function(y) auto.arima(y),
+  arima_stepF_approxF = function(y) auto.arima(y, stepwise = FALSE, approximation = FALSE),
+  arima_stepF_approxT = function(y) auto.arima(y, stepwise = FALSE, approximation = TRUE),
+  arima_boxcox = function(y) auto.arima(y, lambda = "auto", biasadj = TRUE)
+)
+
+arima_results <- data.frame(
+  Model = names(arima_variants),
+  MAE   = NA_real_
+)
+
+for (i in seq_along(arima_variants)) {
+  name <- names(arima_variants)[i]
+  model_fun <- arima_variants[[i]]
+  
+  cat("Evaluating ARIMA variant:", name, "\n")
+  res <- safe_evaluate(model_fun)
+  
+  if (DO_EVALUATION){
+    arima_results$MAE[i] <- res$mae_mean
+  }
+}
+
+arima_results
+```
+
+We obtained the following results :
+
+- `auto.arima(y, stepwise = FALSE, approximation = FALSE)` \| MAE = 554.0935  
+- `auto.arima(y, stepwise = FALSE, approximation = TRUE)`  \| MAE = 559.2148  
+- `auto.arima(y, lambda = "auto", biasadj = TRUE)`         \| MAE = 6265.586
+
+The lowest score was obtained using `auto.arima(y, stepwise = FALSE, approximation = FALSE)`, with $MAE_{arima\_opt}$
+On the Kaggle leaderboard, this best ARIMA submission achieved a MAE of **565.6687**
+
+## 3.b - TBATS
+
+We selected these specific TBATS variants because each hyperparameter addresses a distinct modelling aspect: - the Box–Cox transformation was included to evaluate whether variance stabilisation could improve accuracy - the “no trend” configuration tested whether removing the trend component would reduce overfitting on short or stationary series - the damped trend version examined whether damping could produce more stable long-horizon forecasts for series with weakening trends.
+
+These variations allowed us to assess the contribution of each structural element in TBATS and determine whether manual adjustments could outperform the default, automatically selected specification.
+
+The overall score we have to defeat for TBATS is  $MAE_{tbats}$ = 519.9090
+
+```{r}
+tbats_variants <- list(
+  default_tbats       = function(y) tbats(y),
+  tbats_boxcox        = function(y) tbats(y, use.box.cox = TRUE),
+  tbats_damped        = function(y) tbats(y, use.trend=TRUE, use.damped.trend=TRUE),
+  tbats_no_trend      = function(y) tbats(y, use.trend=FALSE),
+  tbats_arma_errors   = function(y) tbats(y, use.arma.errors=TRUE)
+)
+
+tbats_results <- data.frame(
+  Model = names(tbats_variants),
+  MAE   = NA_real_
+)
+
+for (i in seq_along(tbats_variants)) {
+  name <- names(tbats_variants)[i]
+  model_fun <- tbats_variants[[i]]
+  
+  cat("Evaluating TBATS variant:", name, "\n")
+  res <- safe_evaluate(model_fun)
+  
+  if (DO_EVALUATION){
+    tbats_results$MAE[i] <- res$mae_mean
+  }
+}
+```
+
+We obtained the following results : 
+
+- `tbats(y, use.box.cox=TRUE)` \| MAE = 477.7243 
+- `tbats(y, use.trend=TRUE, use.damped.trend=TRUE)` \| MAE = 495.5002
+- `tbats(y, use.trend = FALSE)` \| MAE = 492.4595
+
+The default version of TBATS remains the best :
+
+- `tbats(y, use.arma.errors = TRUE)` with an MAE of $MAE_{tbats\_opt}$ = **477.5424**
+
+On the Kaggle leaderboard, this best TBATS submission achieved a MAE of **558.40071**
+
+## 3.c - Linear regression
+
+For the linear regression family, we use the `tslm()` function to fit time–series linear models with deterministic components: a time trend and, when appropriate, seasonal dummy variables.
+
+Since there are no actual hyperparameters for this model, sswe compared three TSLM specifications. The simplest one, $$
+\texttt{tslm}(y \sim \texttt{trend}),
+$$ acts as our baseline, and the other two extend it by adding seasonality and a Box–Cox transformation.
+
+1.  **Trend-only model (baseline)**\
+    `tslm(y ~ trend)`\
+    This captures a global upward or downward movement in the series using a single time covariate. It is a very simple parametric benchmark and can work reasonably well for short or noisy series, where fitting more complex dynamics is difficult. Its cross-validated MAE is  $MAE_{linreg}$ = 1003.5006
+
+
+2.  **Trend + seasonality model**\
+    `tslm(y ~ trend + season)` (only when `frequency(y) > 1`, otherwise it reduces to `tslm(y ~ trend)`)\
+    Many of the 600 series exhibit clear seasonal patterns. Adding seasonal dummy variables allows the model to capture systematic within-period effects and reduce residual seasonality when genuine seasonal structure is present.
+
+3.  **Box–Cox + trend + seasonality model**\
+    `tslm(y ~ trend + season, lambda = "auto")` (when `frequency(y) > 1`; otherwise `tslm(y ~ trend, lambda = "auto")`)\
+    The Box–Cox transformation is intended to stabilise the variance and make the residuals closer to normality, which may help in series with strong heteroscedasticity.
+
+These three models are: 
+
+- Computationally cheap to estimate, so they can be applied to all 600 series under cross-validation. 
+- Transparent and interpretable, as coefficients on the trend and seasonal dummies have a clear meaning. 
+- Reasonably robust on non-seasonal or short series: by only including `season` when `frequency(y) > 1`, we avoid fitting meaningless seasonal dummies and reduce the risk of overfitting.
+
+On the Kaggle leaderboard, the best TSLM submission achieved a MAE of $MAE_{linreg\_opt}$ = **970.44**. Overall, TSLM provides a fast and interpretable baseline, but all three TSLM specifications remain clearly less accurate than our best ARIMA and TBATS models.
+
+```{r}
+
+
+tslm_variants <- list(
+  # Trend only
+  lr_trend_only = function(y) {
+    tslm(y ~ trend)
+  },
+  
+  # Trend + seasonal dummies
+  lr_season = function(y) {
+    if (frequency(y) > 1)
+      tslm(y ~ trend + season)
+    else
+      tslm(y ~ trend)
+  },
+  
+  # BoxCox + trend + seasonal dummies
+  lr_boxcox = function(y) {
+    if (frequency(y) > 1)
+      tslm(y ~ trend + season, lambda = "auto")
+    else
+      tslm(y ~ trend, lambda = "auto")
+  }
+)
+
+tslm_results <- data.frame(
+  Model = names(tslm_variants),
+  MAE   = NA_real_
+)
+
+for (i in seq_along(tslm_variants)) {
+  name <- names(tslm_variants)[i]
+  model_fun <- tslm_variants[[i]]
+
+  cat("Evaluating TSLM variant:", name, "\n")
+  res <- safe_evaluate(model_fun)
+  
+  if(DO_EVALUATION){
+  tslm_results$MAE[i] <- res$mae_mean
+  }
+}
+
+tslm_results
+```
+
+We obtained the following results : 
+
+- `tslm(y ~ trend)` \| MAE = 1003.501 
+- `tslm(y ~ trend + season)` \| MAE = 995.1405 
+- `tslm(y ~ trend + season, lambda = "auto")` \| MAE = 1286.8247
+
+The seasonal variant slightly improves the cross-validated MAE to **995.1405**. However, when we tried to add BoxCox transformation to it, it performed worse, with a cross-validated MAE of 1286.8247. Even the best TSLM model remains less accurate than the best ARIMA and TBATS variants.
+
+## Best models' submission
+
+Among all our results, we select the best model for each and generate the Kaggle submissions :
+
+```{r}
+
+DO_EVALUATION  <- TRUE
+
+best_arima_fun <- function(y) {
+  auto.arima(y, stepwise = FALSE, approximation = FALSE)
+}
+best_arima_name <- "arima_stepF_approxF"
+res_best_arima  <- safe_evaluate(best_arima_fun, paste0("best_", best_arima_name))
+
+best_tbats_fun <- function(y) {
+  tbats(y, use.box.cox = TRUE)   # <- best according to your results
+}
+best_tbats_name <- "tbats_boxcox"
+res_best_tbats  <- safe_evaluate(best_tbats_fun, paste0("best_", best_tbats_name))
+
+best_tslm_fun <- function(y) {
+  if (frequency(y) > 1)
+    tslm(y ~ trend + season)
+  else
+    tslm(y ~ trend)
+}
+best_tslm_name <- "tslm_trend_season"
+res_best_lr    <- safe_evaluate(best_tslm_fun, paste0("best_", best_tslm_name))
+
+
+cat("Best ARIMA:", best_arima_name, "\n")
+cat("Best TBATS:", best_tbats_name, "\n")
+cat("Best TSLM:",  best_tslm_name,  "\n")
+
+best_models <- setNames(
+  list(best_arima_fun, best_tbats_fun, best_tslm_fun),
+  c(
+    paste0("arima_", best_arima_name),
+    paste0("tbats_", best_tbats_name),
+    paste0("tslm_",  best_tslm_name)
+  )
+)
+
+
+if (DO_SUBMISSIONS) {
+  for (name in names(best_models)) {
+    cat("Generating submission:", name, "\n")
+    generate_submission(best_models[[name]], paste0(name, ".csv"))
+  }
+} else {
+  message("Skipping submission generation.")
+}
+
+
+
+```
+
+## 4 - Analyzing the results of the best performing algorithms
+
+We plot the time series and the residuals for the three time series where the results are the best and the worst for each algorithm
+
+### 4.a - Analysis of best ARIMA model
+
+```{r}
+if (DO_PLOTS) {
+  plot_ts(best_arima_fun, res_best_arima)
+}
+```
+
+These six series illustrate cases where ARIMA performs very well and where it fails.
+
+For the time series where ARIMA performs poorly (high MAE) : 
+
+- the 3 time series all have yearly frequency, no seasonality, and are also quite short with no stable trend.
+
+From the residuals analysis : 
+
+- the residual time plots don't look like random noise, and display swings from positive to negative value, showing that the model has not fully captured the pattern 
+- on the ACF of residuals, there only 3 or 4 lags, which makes it's almost impossible to diagnose anything. The variance is also high, meaning that the model produces large errors even if they are uncorrelated.
+- the histogram of residuals are wide, skewed, or irregular, showing unstable or poorly modeled variance.
+
+For the time series where ARIMA performs well (low MAE) : 
+
+- the time series are quite long and display clear seasonality (with hourly/monthly/daily frequency)
+
+From the residuals analysis : 
+
+- on the residual time plots, the fluctuations oscillate randomly around zero with no discernible structure 
+- the ACF of residuals show that most of the autocorrelation spikes fall inside the confidence bands, confirming that no predictive structure is left unmodeled 
+- the histogram of residuals display an approximately symmetric, bell-shaped distribution with stable variance.
+
+Thus, we can conclude that ARIMA works well on time series that are long, stable, clearly seasonal, where patterns repeat consistently; but it fails when the series are short, noisy, or have structural breaks.
+
+### 4.b - Analysis of best TBATS model
+
+```{r}
+if (DO_PLOTS) {
+  plot_ts(best_tbats_fun, res_best_tbats)
+}
+```
+
+The diagnostic plots for TBATS show a clear contrast between the series where the model performs well and those where it performs poorly. For the well-fitting series (e.g., 469, 560, 300), the seasonal plots display smooth and highly regular seasonal patterns, which TBATS captures effectively. The corresponding residual ACFs show no significant autocorrelation, indicating that most of the structure in the data has been removed and that the residuals behave close to white noise. This is also reflected in the very low MAE values for these series, confirming that the model handles complex and stable seasonality particularly well.
+
+In contrast, the poorly-fitting series (e.g., 48, 478, 84) exhibit little or no consistent seasonal pattern, higher noise levels, or abrupt structural changes. The seasonal plots show irregular or unstable behaviour that TBATS cannot model reliably, and the residual ACFs display remaining autocorrelation—sometimes very strong—indicating underfitting or convergence issues. In these cases, TBATS produces much higher forecast errors, often worse than the naïve benchmark. Overall, the diagnostics suggest that TBATS is highly effective for long, clean series with strong seasonal structure, but less suitable for short, noisy, or weakly seasonal time series.
+
+### 4.c - Analysis of best linear regression model
+
+```{r}
+if (DO_PLOTS) {
+  plot_ts(best_tslm_fun, res_best_lr)
+}
+```
+
+For the linear regression model, the diagnostic plots for the three worst and three best series highlight clearly when this approach works and when it fails.
+
+For the worst performing time series (32, 198, 63) : all three series show strong non-linear growth (almost exponential) and in some cases abrupt changes near the end of the sample. A model with only a linear trend + seasonal dummies cannot capture this curvature, so the forecasts systematically under- or over-shoot the last observed values, leading to very large MAE (around 7000).
+
+- The residual time plots show clear remaining structure (persistent upward or downward drifts) rather than random noise. The ACF of the residuals has many significant positive lags, indicating strong autocorrelation and model mis-specification.
+- The residual histograms are also skewed and heavy-tailed, confirming that the linear regression leaves important dynamics unexplained. Overall, these series are too complex / non-linear for a simple deterministic TSLM and would require a richer stochastic model (e.g. ARIMA, ETS, or transformations).
+
+For the best performing time series (469, 144, 141) : the series display a combination of trend and regular seasonality, which is exactly what the TSLM with trend + season is designed to capture. The forecast lines (in green) extend the recent pattern of the training data smoothly, and the MAE values are very small (close to 0–10).
+
+- The residual plots are roughly centered around zero, with much smaller magnitude than in the worst cases. The residual histograms are closer to symmetric and bell-shaped.
+- Although the ACF sometimes shows mild remaining seasonal correlation, most spikes are within or only slightly outside the significance bounds, so the residuals are closer to white noise. This suggests that, for series with stable seasonality and approximately linear trend, TSLM provides an adequate and parsimonious fit.
+
+In summary, the plots confirm that TSLM performs well when the data are well described by a linear trend plus stable seasonal pattern, but it struggles on series with strong non-linear growth or structural changes, where large autocorrelated residuals and very high MAE values appear. This is consistent with the overall cross-validation results, where TSLM is outperformed by more flexible models such as ARIMA and TBATS."
+
+### 4.d - Comparison of the results and takeaways
+
+From the examination of all best and worst cases, we can conclude that each forecasting method performs well only when its underlying assumptions match the structure of the time series.
+
+- **ARIMA** works best on long, stable series with smooth evolution and clear temporal dependence, but fails on short, noisy yearly data with no identifiable autocorrelation. 
+- **TBATS** works very well when the seasonality is strong, regular, and possibly complex (daily, weekly, hourly patterns), but performs poorly when seasonality is weak or unstable. 
+- **Linear regression** performs well only when the data follow a simple linear trend with regular seasonal repetition; it breaks down on any non-linear or structurally changing series.
+
+When different models are applied to the same time series (e.g. time series 469), the contrast becomes even clearer. On strongly seasonal hourly or monthly series, TBATS consistently outperforms ARIMA and TSLM. On smooth trending series with moderate autocorrelation, ARIMA offers more accurate forecasts. On simple seasonal-trend patterns, TSLM with dummy variables often gives predictions similar to ARIMA but with a much simpler structure.
+
+Conversely, on short, noisy yearly series, all models struggle, but ARIMA and TSLM fail particularly sharply, while TBATS sometimes stabilises the forecasts slightly thanks to its smoother components. Overall, no model is universally optimal. Each one is effective only when the series contains the type of structure it is designed to capture. Matching the algorithm to the characteristics of the data is therefore essential for achieving good forecasting performance on heterogeneous collections of time series.
+
+## 5 - Our strategy to win the competition
+
+Beyond the systematic model comparison performed in the previous sections, we tried to adopt a more flexible and competition-oriented forecasting strategy, with the objective to obtain the best possible Kaggle score.
+
+The main motivation was the heterogeneity of the 600 time series: some of them are short, strongly seasonal or non seasonal, with different seasonalities, some are dominated by trend, some of them are noisy, etc.A single model family is unlikely to be optimal for all of them. This diversity led us to implement a hybrid forecaster that selects the most appropriate model for each individual series based on:
+
+1.  Its frequency (e.g. weekly / hourly → TBATS performs better)\
+2.  Its length (short series → naive or seasonal naive fallback)\
+3.  AICc comparison between ETS model and ARIMA when both are applicable\
+4.  Robust fallbacks when models fail (ARIMA/ETS errors, insufficient data)
+
+The idea behind this hybrid approach is simply pragmatic: instead of forcing one model family to fit all 600 series, we let each series choose its own best-performing model, which is consistent with the philosophy of TBATS or ARIMA framework for instance : different structures excel on different patterns.
+
+Below is the implementation of this hybrid forecasting strategy
+
+Our final model used a decision tree structure to decide based on the time series seasonality complexity, frequency and the size of the time series. For simple short time(length \< 3 ) series the naive method is applied as more complex algorithms would not have enough information. For long complex time series with multiple seasonal patterns the algorithm applied TBATS as we found that it achieves the best score with time series with multiple seasonality patterns.
+
+Due to the risk that TBATS might over fit the data the algorithm falls back to a simpler seasonal naive which is less sensitive to noise for example TBATS may not converge if the series has high noise.
+
+For a simpler time series the algorithm runs Auto ARIMA which can adapt well to simpler models with non multiple seasonality as well as ETS (simple smoothing) where it chooses which one based on the lower AICc score, and the fallback of naive and seasonal naive. We decided due to the high cross validation and Kaggle score to leave linear regression out of the algorithm.
+
+```{r}
+
+#   HYBRID BASELINE FORECASTER FOR KAGGLE COMPETITION
+#   - Weekly / high-frequency (freq > 24)  -> TBATS
+#   - Others -> ETS vs ARIMA (AICc) with snaive/naive fallback
+#   - Backtests and also writes Kaggle-style predictions CSV
+
+library(forecast)
+library(ggplot2)
+
+DO_PLOTS <- FALSE
+DO_EVALUATION <- FALSE
+
+#  Hybrid model selection + forecast for one series
+
+best_forecast <- function(y, freq_num, h){
+  y_num   <- as.numeric(y)
+  freq_use <- ifelse(is.na(freq_num) || freq_num <= 0, 1, freq_num)
+  ts_y    <- ts(y_num, frequency = freq_use)
+  n       <- length(ts_y)
+  
+  # If very short series, just repeat last observed value
+  if (n < 3) {
+    return(rep(tail(y_num, 1), h))
+  }
+  
+  # CASE with long seasonal period (weekly, etc)
+  # freq > 24 is where ETS struggles, according to our residuals analysis TBATS is designed for this
+  
+  if (freq_use > 24 && n > 2 * freq_use) {
+    fit_tbats <- tryCatch(tbats(ts_y), error = function(e) NULL)
+    if (!is.null(fit_tbats)) {
+      fc_tbats <- forecast(fit_tbats, h = h)
+      return(as.numeric(fc_tbats$mean))
+    } else {
+      # If TBATS fails, fall back to seasonal naive if possible, else naive
+      if (n >= 2 * freq_use) {
+        return(as.numeric(snaive(ts_y, h = h)$mean))
+      } else {
+        return(rep(tail(y_num, 1), h))
+      }
+    }
+  }
+  
+  # General case : freq <= 24
+  fc_list   <- list()
+  aicc_list <- c()
+  
+  # ETS (freq <= 24 is safe)
+  fit_ets <- tryCatch(ets(ts_y), error = function(e) NULL)
+  if (!is.null(fit_ets)) {
+    fc_list[["ets"]] <- forecast(fit_ets, h = h)
+    aicc_list["ets"] <- fit_ets$aicc
+  }
+  
+  # ARIMA with capped differencing
+  fit_arima <- tryCatch(
+    auto.arima(ts_y,
+               stepwise      = TRUE,
+               approximation = FALSE,
+               max.d         = 2,
+               max.D         = 1),
+    error = function(e) NULL
+  )
+  if (!is.null(fit_arima)) {
+    fc_list[["arima"]] <- forecast(fit_arima, h = h)
+    aicc_list["arima"] <- fit_arima$aicc
+  }
+  
+  # Seasonal / non-seasonal naive fallbacks (never "win" by AICc)
+  if (freq_use > 1 && n >= 2 * freq_use) {
+    fc_list[["snaive"]] <- snaive(ts_y, h = h)
+    aicc_list["snaive"] <- Inf
+  } else {
+    fc_list[["naive"]]  <- naive(ts_y, h = h)
+    aicc_list["naive"]  <- Inf
+  }
+  
+  # If everything failed (which is very unlikely): repeat last value
+  if (length(aicc_list) == 0) {
+    return(rep(tail(y_num, 1), h))
+  }
+  
+  # Choose model with lowest AICc
+  best_name <- names(which.min(aicc_list))
+  fc_best   <- fc_list[[best_name]]
+  
+  as.numeric(fc_best$mean)
+}
+
+
+# Simple visualization (history + forecast, integer index)
+
+plot_forecast <- function(y, forecast_vals, ind){
+  y_num <- as.numeric(y)
+  n     <- length(y_num)
+  h     <- length(forecast_vals)
+  
+  df_hist <- data.frame(
+    Index = 1:n,
+    Value = y_num,
+    Type  = "Historical"
+  )
+  
+  df_fc <- data.frame(
+    Index = (n + 1):(n + h),
+    Value = as.numeric(forecast_vals),
+    Type  = "Forecast"
+  )
+  
+  df <- rbind(df_hist, df_fc)
+  
+  p <- ggplot(df, aes(Index, Value, colour = Type)) +
+    geom_line(size = 0.7) +
+    labs(title = paste("Time Series", ind, "- History & Forecast"),
+         x = "Index",
+         y = "Value") +
+    scale_color_manual(values = c("Historical" = "blue", "Forecast" = "red")) +
+    theme_minimal()
+  
+  print(p)
+}
+
+convert_frequency = function(freq){
+  Freq_string = c("Daily", "Hourly", "Monthly", "Quarterly", "Weekly", "Yearly")
+  Freq_number = c(7, 24, 12, 4, 52, 1)
+  ind  = which(freq == Freq_string)
+  return(Freq_number[ind])
+}
+
+
+# Load frequency & forecast horizons
+
+frequency_mat <- as.matrix(read.csv(frequencyfile, stringsAsFactors = FALSE))
+ahead_mat     <- as.matrix(read.csv(aheadfile))
+
+freq_labels <- as.character(frequency_mat[,1])
+ahead_vec   <- as.numeric(ahead_mat[,1])
+
+# 5. Backtest loop over all 600 series (compute MAE)
+#    + store predictions for Kaggle output
+
+if (DO_EVALUATION) {
+
+  mae_series     <- numeric(600)
+  all_abs_errors <- c()
+
+  pred_list <- vector("list", 600)
+
+  for (ind in 1:600) {
+    cat("Backtesting series", ind, "of 600\n")
+    
+    h    <- ahead_vec[ind]
+    name <- paste("./train/train_", ind, ".csv", sep = "")
+    y    <- as.numeric(as.matrix(read.csv(name))[,1])
+    
+    n <- length(y)
+    
+    if ((n - h) < 2) {
+      mae_series[ind] <- NA
+      pred_list[[ind]] <- numeric(0)
+      next
+    }
+    
+    train_y <- y[1:(n - h)]
+    test_y  <- y[(n - h + 1):n]
+    
+    freq_num <- convert_frequency(freq_labels[ind])
+    
+    pred <- best_forecast(train_y, freq_num, h)
+    
+    len <- min(length(pred), length(test_y))
+    pred <- pred[1:len]
+    test_cut <- test_y[1:len]
+    
+    pred_list[[ind]] <- pred
+    
+    abs_errs <- abs(test_cut - pred)
+    mae_series[ind] <- mean(abs_errs)
+    all_abs_errors  <- c(all_abs_errors, abs_errs)
+    
+    if (DO_PLOTS) {
+      tryCatch(
+        plot_forecast(train_y, pred, ind),
+        error = function(e) message("Plot failed for series ", ind)
+      )
+    }
+  }
+
+  # Summary results
+  overall_mae <- mean(all_abs_errors, na.rm = TRUE)
+  cat("\n=====================================\n")
+  cat("Overall MAE (all series):", overall_mae, "\n")
+  cat("=====================================\n\n")
+
+  mae_df <- data.frame(series = 1:600, mae = mae_series)
+  print(head(mae_df, 20))
+
+  # Write Kaggle file if necessary
+  if (DO_SUBMISSIONS) {
+    all_preds <- unlist(pred_list)
+  
+    my_pred <- data.frame(
+      Id        = 1:length(all_preds),
+      Predicted = all_preds
+    )
+    
+    write.csv(my_pred, "my_pred.csv", row.names = FALSE)
+    cat("Prediction file written: my_pred.csv\n")
+  }
+
+} else {
+
+  message("Skipping hybrid model backtesting.")
+}
+```
+
+Our method achieved a solid public Kaggle score of 534.62805, but the private score dropped to 535.18389, suggesting that the model did not generalize as well when evaluated on the full dataset. This indicates that performance decreased as the amount of unseen data increased.
+
+One likely reason is that our decision process relied on global, hand-crafted rules. For example, one rule—“use TBATS when frequency \> 24”—assumes that long-seasonal series are always best handled by the same model. In practice, these rules can be overly rigid and sensitive to noise, especially for series that do not follow the expected patterns.
+
+If we were to repeat this project, we would replace these global rules with a more adaptive, data-driven approach. Instead of selecting a model based on a single heuristic, we would use a slower but more reliable brute-force model selection strategy. This would involve fitting several forecasting models—such as ETS, ARIMA, BATS, and TBATS—to each individual time series and choosing the one with the lowest validation error (e.g., MAE).
+
+The trade-off is increased computational time, but the benefit is a forecasting system that: - adapts to the characteristics of each time series - is less sensitive to noise - avoids overfitting to patterns in the public leaderboard - provides more stable performance on the private test set
+
+This more flexible, data-driven approach would likely have produced a more robust final score.
+
+Another approach would be to use time series decomposition to extract the main patterns of each time series and choosing which algorithm to apply using a similar rule-based approach.
